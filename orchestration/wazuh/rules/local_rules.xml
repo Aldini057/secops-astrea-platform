@@ -1,0 +1,145 @@
+<!--
+  SecOps Astrea Platform - Wazuh EDR/XDR Local Correlation Rules
+  File: orchestration/wazuh/rules/local_rules.xml
+  IDs Range: 100000 - 100999
+-->
+<group name="astrea,astrea_soc,local,syslog,">
+
+  <!-- ===================================================================== -->
+  <!-- 1. PORT SCANNING & RECONNAISSANCE DETECTION                          -->
+  <!-- ===================================================================== -->
+
+  <!-- Base trigger: Individual connection drop or port probe -->
+  <rule id="100001" level="4">
+    <decoded_as>iptables</decoded_as>
+    <match>DROP|REJECT|BLOCK</match>
+    <description>Astrea EDR: Firewall rejected or dropped incoming packet on closed port.</description>
+    <group>firewall_drop,reconnaissance,</group>
+  </rule>
+
+  <!-- Base trigger: Nmap / Stealth scan probe signature -->
+  <rule id="100002" level="6">
+    <match>Nmap|SYN stealth scan|Port scan|nmap-scan|TCP SYN scan</match>
+    <description>Astrea EDR: Network port scan probe signature detected.</description>
+    <mitre>
+      <id>T1046</id>
+    </mitre>
+    <group>reconnaissance,portscan,</group>
+  </rule>
+
+  <!-- Correlated: Aggressive Port Scan Burst (Multiple connection drops in short timeframe) -->
+  <rule id="100003" level="10" frequency="10" timeframe="60">
+    <if_matched_sid>100001</if_matched_sid>
+    <same_source_ip />
+    <description>Astrea EDR: Aggressive port scan burst detected from source IP (Level 10 - Active Response candidate).</description>
+    <mitre>
+      <id>T1046</id>
+    </mitre>
+    <group>reconnaissance,attack,portscan_burst,active_response,</group>
+  </rule>
+
+  <!-- Correlated: Aggressive Nmap SYN scan burst -->
+  <rule id="100004" level="11" frequency="5" timeframe="30">
+    <if_matched_sid>100002</if_matched_sid>
+    <same_source_ip />
+    <description>Astrea EDR: Critical Nmap SYN scan burst detected from source IP (Level 11 - Immediate containment).</description>
+    <mitre>
+      <id>T1046</id>
+    </mitre>
+    <group>reconnaissance,attack,nmap_syn_scan,active_response,</group>
+  </rule>
+
+
+  <!-- ===================================================================== -->
+  <!-- 2. SSH & RDP BRUTE FORCE DETECTION                                   -->
+  <!-- ===================================================================== -->
+
+  <!-- Base trigger: SSH Authentication Failure -->
+  <rule id="100010" level="5">
+    <if_sid>5710, 5716</if_sid>
+    <description>Astrea EDR: SSH single authentication failure.</description>
+    <group>authentication_failed,sshd,</group>
+  </rule>
+
+  <!-- Correlated: SSH Brute Force Attack (Multiple failed attempts in 120s window) -->
+  <rule id="100011" level="10" frequency="6" timeframe="120">
+    <if_matched_sid>100010</if_matched_sid>
+    <same_source_ip />
+    <description>Astrea EDR: SSH Brute Force attack detected from source IP (Level 10 - Block IP).</description>
+    <mitre>
+      <id>T1110.001</id>
+    </mitre>
+    <group>authentication_failures,bruteforce,ssh_bruteforce,active_response,</group>
+  </rule>
+
+  <!-- Base trigger: RDP / Windows Logon Failure (Event ID 4625 / xrdp) -->
+  <rule id="100012" level="5">
+    <match>Logon Failure|failed logon|failed authentication|Event ID: 4625|pam_unix(xrdp-sesman:auth): authentication failure</match>
+    <description>Astrea EDR: RDP or Windows interactive logon failure.</description>
+    <group>authentication_failed,rdp,windows,</group>
+  </rule>
+
+  <!-- Correlated: RDP Brute Force Attack (Multiple failed logon attempts in 120s window) -->
+  <rule id="100013" level="10" frequency="5" timeframe="120">
+    <if_matched_sid>100012</if_matched_sid>
+    <same_source_ip />
+    <description>Astrea EDR: RDP Brute Force attack detected from source IP (Level 10 - Block IP).</description>
+    <mitre>
+      <id>T1110.001</id>
+    </mitre>
+    <group>authentication_failures,bruteforce,rdp_bruteforce,active_response,</group>
+  </rule>
+
+
+  <!-- ===================================================================== -->
+  <!-- 3. WEB EXPLOITATION, DIRECTORY TRAVERSAL & ANOMALOUS COMMANDS         -->
+  <!-- ===================================================================== -->
+
+  <!-- Apache Path Traversal & RCE: CVE-2021-41773 & CVE-2021-42013 -->
+  <rule id="100020" level="12">
+    <match>icons/.%2e/|cgi-bin/.%2e/|/.%2e/|.%2e/.%2e|%%32%65%%32%65|.%2e/%2e%2e</match>
+    <description>Astrea EDR: Apache HTTP Server Directory Traversal &amp; RCE attempt (CVE-2021-41773 / CVE-2021-42013) (Level 12 - Isolate Host).</description>
+    <mitre>
+      <id>T1190</id>
+      <id>T1059</id>
+    </mitre>
+    <group>web,attack,cve_2021_41773,directory_traversal,active_response,</group>
+  </rule>
+
+  <!-- Generic Web Application Directory Traversal / Arbitrary File Read -->
+  <rule id="100021" level="10">
+    <match>/etc/passwd|/etc/shadow|/winnt/system32|..%2f..%2f|%2e%2e%2f|/..%2f|/..\..\</match>
+    <description>Astrea EDR: Web Directory Traversal / Path Traversal attempt detected (Level 10 - Block IP).</description>
+    <mitre>
+      <id>T1190</id>
+      <id>T1083</id>
+    </mitre>
+    <group>web,attack,directory_traversal,active_response,</group>
+  </rule>
+
+  <!-- Anomalous curl / wget execution downloading from public IP or piping to shell -->
+  <rule id="100030" level="11">
+    <match>curl |wget </match>
+    <regex>(\bcurl\b|\bwget\b).*(\bsh\b|\bbash\b|\bpython\b|http://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|https://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|-O-\s*\|\s*sh|-O-\s*\|\s*bash|\|\s*sh|\|\s*bash)</regex>
+    <description>Astrea EDR: Anomalous execution of curl/wget downloading payload from public IP or piping to shell (Level 11 - Isolate Host).</description>
+    <mitre>
+      <id>T1059.004</id>
+      <id>T1105</id>
+    </mitre>
+    <group>command_execution,suspicious_process,ingress_tool_transfer,active_response,</group>
+  </rule>
+
+  <!-- Sysmon Process Creation: Suspicious curl / wget downloading executable or piping -->
+  <rule id="100031" level="11">
+    <if_group>sysmon_process_create</if_group>
+    <match>curl|wget</match>
+    <regex>(\bcurl\b|\bwget\b).*(\||-O-|/dev/tcp/|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})</regex>
+    <description>Astrea EDR: Sysmon detected suspicious process execution using curl or wget downloading payload (Level 11 - Isolate Host).</description>
+    <mitre>
+      <id>T1059.004</id>
+      <id>T1105</id>
+    </mitre>
+    <group>sysmon,process_creation,ingress_tool_transfer,active_response,</group>
+  </rule>
+
+</group>

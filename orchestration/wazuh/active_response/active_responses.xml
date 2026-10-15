@@ -1,0 +1,45 @@
+<!--
+  SecOps Astrea Platform - Wazuh Active Response Configuration
+  File: orchestration/wazuh/active_response/active_responses.xml
+-->
+<ossec_config>
+
+  <!-- ===================================================================== -->
+  <!-- 1. COMMAND DEFINITIONS                                                -->
+  <!-- ===================================================================== -->
+
+  <!-- Command: isolate-host (Full network containment preserving Wazuh port) -->
+  <command>
+    <name>isolate-host</name>
+    <executable>isolate-host.sh</executable>
+    <timeout_allowed>yes</timeout_allowed>
+  </command>
+
+  <!-- Command: block-ip (Targeted firewall-drop of attacker source IP) -->
+  <command>
+    <name>block-ip</name>
+    <executable>block-ip.sh</executable>
+    <timeout_allowed>yes</timeout_allowed>
+  </command>
+
+  <!-- ===================================================================== -->
+  <!-- 2. ACTIVE RESPONSE ASSOCIATIONS                                       -->
+  <!-- ===================================================================== -->
+
+  <!-- Active Response: isolate-host for critical exploits and remote code execution -->
+  <active-response>
+    <command>isolate-host</command>
+    <location>defined-agent</location>
+    <rules_id>100020,100030,100031</rules_id>
+    <timeout>1800</timeout>
+  </active-response>
+
+  <!-- Active Response: block-ip for port scans, brute force, and path traversal -->
+  <active-response>
+    <command>block-ip</command>
+    <location>defined-agent</location>
+    <rules_id>100003,100004,100011,100013,100021</rules_id>
+    <timeout>600</timeout>
+  </active-response>
+
+</ossec_config>
