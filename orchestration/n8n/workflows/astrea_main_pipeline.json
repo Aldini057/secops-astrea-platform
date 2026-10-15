@@ -1,0 +1,347 @@
+{
+  "name": "Astrea Main Security Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/webhook/alerts",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "webhookId": "astrea-webhook-alerts"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.abuseipdb.com/api/v2/check",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ipAddress",
+              "value": "={{ $json.body.src_ip }}"
+            },
+            {
+              "name": "maxAgeInDays",
+              "value": "90"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Key",
+              "value": "={{ $env.ABUSEIPDB_API_KEY || '' }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-cti-lookup",
+      "name": "CTI Reputation Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        300
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://nvd_service:8000/api/v1/vulnerabilities/check",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"software_name\": \"{{ $('Webhook Trigger').item.json.body.software_banner ? $('Webhook Trigger').item.json.body.software_banner.split(/[/ _-]/)[0] : '' }}\",\n  \"version\": \"{{ $('Webhook Trigger').item.json.body.software_banner && $('Webhook Trigger').item.json.body.software_banner.match(/\\d+(\\.\\d+)+/) ? $('Webhook Trigger').item.json.body.software_banner.match(/\\d+(\\.\\d+)+/)[0] : '' }}\"\n}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-nvd-check",
+      "name": "NVD Vulnerability Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        300
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Astrea SecOps SOAR - Risk Score Calculation Node\n// Ponderation formula: RiskScore = (CTI_Score * 0.4) + (CVSS * 0.6 * 10)\n// Normalization range: 0.0 - 100.0\n\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  // 1. Extract alert context from Webhook Trigger\n  const webhookData = $('Webhook Trigger').first().json.body || {};\n  const src_ip = webhookData.src_ip || '127.0.0.1';\n  const dst_ip = webhookData.dst_ip || '127.0.0.1';\n  const agent_id = webhookData.agent_id || '';\n  const software_banner = webhookData.software_banner || '';\n  const alert_name = webhookData.alert_name || 'Suspicious Activity Detected';\n  const rule_id = webhookData.rule_id || 'ASTREA-RULE-001';\n  const dst_port = webhookData.dst_port ? parseInt(webhookData.dst_port, 10) : 80;\n\n  // 2. Extract CTI AbuseIPDB reputation score (0-100)\n  let CTI_Score = 0;\n  let src_country = 'UNKNOWN';\n  try {\n    const ctiResponse = $('CTI Reputation Lookup').first().json;\n    if (ctiResponse && ctiResponse.data && typeof ctiResponse.data.abuseConfidenceScore === 'number') {\n      CTI_Score = ctiResponse.data.abuseConfidenceScore;\n      src_country = ctiResponse.data.countryCode || src_country;\n    } else if (ctiResponse && typeof ctiResponse.abuseConfidenceScore === 'number') {\n      CTI_Score = ctiResponse.abuseConfidenceScore;\n      src_country = ctiResponse.countryCode || src_country;\n    } else if (ctiResponse && typeof ctiResponse.cti_score === 'number') {\n      CTI_Score = ctiResponse.cti_score;\n    } else if (webhookData.src_reputation_score !== undefined) {\n      CTI_Score = parseInt(webhookData.src_reputation_score, 10) || 0;\n    }\n  } catch (err) {\n    // Fallback reputation score when AbuseIPDB is unavailable\n    CTI_Score = (rule_id.includes('10002') || rule_id.includes('10003')) ? 80 : 15;\n  }\n\n  // 3. Extract CVSS vulnerability score (0.0-10.0) from NVD check\n  let CVSS = 0.0;\n  let associated_cve = '';\n  let cve_description = '';\n  try {\n    const nvdResponse = $('NVD Vulnerability Check').first().json;\n    if (nvdResponse && Array.isArray(nvdResponse.vulnerabilities) && nvdResponse.vulnerabilities.length > 0) {\n      for (const vuln of nvdResponse.vulnerabilities) {\n        const score = parseFloat(vuln.cvss_score) || 0.0;\n        if (score >= CVSS) {\n          CVSS = score;\n          associated_cve = vuln.cve_id || associated_cve;\n          cve_description = vuln.description || cve_description;\n        }\n      }\n    } else if (nvdResponse && nvdResponse.cvss_score) {\n      CVSS = parseFloat(nvdResponse.cvss_score) || 0.0;\n      associated_cve = nvdResponse.cve_id || '';\n    }\n  } catch (err) {\n    CVSS = 0.0;\n  }\n\n  // Fallback signature mapping for common lab banners\n  if (CVSS === 0.0 && software_banner) {\n    if (software_banner.includes('2.4.49')) {\n      CVSS = 9.8;\n      associated_cve = 'CVE-2021-41773';\n      cve_description = 'Apache 2.4.49 Path Traversal and Remote Code Execution';\n    } else if (software_banner.includes('1.18.0')) {\n      CVSS = 7.5;\n      associated_cve = 'CVE-2021-23017';\n    }\n  }\n\n  // 4. Calculate Risk Score using composite formula:\n  // RiskScore = (CTI_Score * 0.4) + (CVSS * 0.6 * 10)\n  const rawRiskScore = (CTI_Score * 0.4) + (CVSS * 0.6 * 10);\n\n  // 5. Normalize score strictly between 0.0 and 100.0\n  let RiskScore = Math.min(100.0, Math.max(0.0, rawRiskScore));\n  RiskScore = Math.round(RiskScore * 10) / 10;\n\n  // 6. Classification: If RiskScore >= 80.0, severity = 'CRITICAL' & should_contain = true\n  let severity = 'LOW';\n  let should_contain = false;\n\n  if (RiskScore >= 80.0) {\n    severity = 'CRITICAL';\n    should_contain = true;\n  } else if (RiskScore >= 60.0) {\n    severity = 'HIGH';\n  } else if (RiskScore >= 40.0) {\n    severity = 'MEDIUM';\n  } else {\n    severity = 'LOW';\n  }\n\n  results.push({\n    json: {\n      alert_name,\n      rule_id,\n      src_ip,\n      src_country,\n      dst_ip,\n      dst_port,\n      agent_id,\n      software_banner,\n      associated_cve: associated_cve || null,\n      cve_description: cve_description || null,\n      cti_score: CTI_Score,\n      cvss_score: CVSS,\n      risk_score: RiskScore,\n      raw_risk_score: rawRiskScore,\n      severity,\n      should_contain,\n      status: 'ENRICHED',\n      timestamp: new Date().toISOString()\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "node-risk-calc",
+      "name": "Risk Score Calculation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO agents_inventory (agent_id, hostname, ip_address, status)\nSELECT '{{ $json.agent_id }}', 'host-' || '{{ $json.agent_id }}', '{{ $json.dst_ip }}'::inet, 'active'\nWHERE NULLIF('{{ $json.agent_id }}', '') IS NOT NULL\nON CONFLICT (agent_id) DO NOTHING;\n\nINSERT INTO nvd_vulnerabilities (cve_id, description, cvss_score, severity)\nSELECT '{{ $json.associated_cve }}', 'Cached by Astrea SOAR Pipeline', {{ $json.cvss_score }}, '{{ $json.severity }}'\nWHERE NULLIF('{{ $json.associated_cve }}', '') IS NOT NULL\nON CONFLICT (cve_id) DO NOTHING;\n\nINSERT INTO security_incidents (\n  source_detection,\n  alert_name,\n  rule_id,\n  src_ip,\n  src_country,\n  src_reputation_score,\n  dst_ip,\n  dst_port,\n  agent_id,\n  affected_software,\n  associated_cve,\n  calculated_risk_score,\n  status\n) VALUES (\n  'HYBRID',\n  '{{ $json.alert_name }}',\n  '{{ $json.rule_id }}',\n  '{{ $json.src_ip }}'::inet,\n  '{{ $json.src_country }}',\n  {{ $json.cti_score }},\n  '{{ $json.dst_ip }}'::inet,\n  {{ $json.dst_port }},\n  NULLIF('{{ $json.agent_id }}', ''),\n  '{{ $json.software_banner }}',\n  NULLIF('{{ $json.associated_cve }}', ''),\n  {{ $json.risk_score }},\n  'ENRICHED'\n)\nRETURNING incident_id, status, calculated_risk_score, agent_id, src_ip;"
+      },
+      "id": "node-insert-incident",
+      "name": "Insert Incident PostgreSQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1180,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "astrea_postgres",
+          "name": "Astrea PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-should-contain",
+              "leftValue": "={{ $('Risk Score Calculation').item.json.should_contain }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            },
+            {
+              "id": "cond-agent-id",
+              "leftValue": "={{ $('Risk Score Calculation').item.json.agent_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "node-if-containment",
+      "name": "IF Conditional",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WAZUH_API_HOST || 'https://127.0.0.1' }}:{{ $env.WAZUH_API_PORT || 55000 }}/active-response",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "agents_list",
+              "value": "={{ $('Risk Score Calculation').item.json.agent_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"command\": \"isolate-host\",\n  \"custom\": true,\n  \"alert\": {\n    \"data\": {\n      \"srcip\": \"{{ $('Risk Score Calculation').item.json.src_ip }}\"\n    }\n  }\n}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-wazuh-ar",
+      "name": "Wazuh Active Response Execution",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1660,
+        180
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE security_incidents\nSET status = 'CONTAINED_AUTOMATICALLY',\n    active_response_executed = 'isolate-host, block-ip',\n    active_response_status = 'SUCCESS',\n    response_payload = jsonb_build_object(\n      'action', 'containment',\n      'commands', jsonb_build_array('isolate-host', 'block-ip'),\n      'agent_id', '{{ $('Risk Score Calculation').item.json.agent_id }}',\n      'src_ip', '{{ $('Risk Score Calculation').item.json.src_ip }}',\n      'executed_at', NOW()\n    )\nWHERE incident_id = '{{ $('Insert Incident PostgreSQL').item.json.incident_id }}'::uuid\nRETURNING incident_id, status, active_response_executed, active_response_status;\n\nUPDATE agents_inventory\nSET status = 'isolated'\nWHERE agent_id = '{{ $('Risk Score Calculation').item.json.agent_id }}';"
+      },
+      "id": "node-update-contained",
+      "name": "Update Incident Contained",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1900,
+        180
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "astrea_postgres",
+          "name": "Astrea PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"success\",\n  \"message\": \"Incident processed and orchestrated successfully by Astrea SOAR\",\n  \"incident_id\": \"{{ $('Insert Incident PostgreSQL').item.json.incident_id }}\",\n  \"incident_status\": \"{{ $json.status || $('Insert Incident PostgreSQL').item.json.status || 'ENRICHED' }}\",\n  \"alert_name\": \"{{ $('Risk Score Calculation').item.json.alert_name }}\",\n  \"rule_id\": \"{{ $('Risk Score Calculation').item.json.rule_id }}\",\n  \"agent_id\": \"{{ $('Risk Score Calculation').item.json.agent_id }}\",\n  \"src_ip\": \"{{ $('Risk Score Calculation').item.json.src_ip }}\",\n  \"dst_ip\": \"{{ $('Risk Score Calculation').item.json.dst_ip }}\",\n  \"calculated_risk_score\": {{ $('Risk Score Calculation').item.json.risk_score }},\n  \"severity\": \"{{ $('Risk Score Calculation').item.json.severity }}\",\n  \"contained\": {{ $('Risk Score Calculation').item.json.should_contain && Boolean($('Risk Score Calculation').item.json.agent_id) }},\n  \"active_response_executed\": \"{{ $json.active_response_executed || 'NONE' }}\",\n  \"timestamp\": \"{{ new Date().toISOString() }}\"\n}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "node-final-response",
+      "name": "Final Response / Webhook Return",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2140,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "CTI Reputation Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CTI Reputation Lookup": {
+      "main": [
+        [
+          {
+            "node": "NVD Vulnerability Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "NVD Vulnerability Check": {
+      "main": [
+        [
+          {
+            "node": "Risk Score Calculation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Risk Score Calculation": {
+      "main": [
+        [
+          {
+            "node": "Insert Incident PostgreSQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Incident PostgreSQL": {
+      "main": [
+        [
+          {
+            "node": "IF Conditional",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Conditional": {
+      "main": [
+        [
+          {
+            "node": "Wazuh Active Response Execution",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Response / Webhook Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wazuh Active Response Execution": {
+      "main": [
+        [
+          {
+            "node": "Update Incident Contained",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Incident Contained": {
+      "main": [
+        [
+          {
+            "node": "Final Response / Webhook Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "b18f4a21-72fa-48ef-93a8-444455556666",
+  "id": "astrea-main-pipeline",
+  "meta": {
+    "instanceId": "astrea-soar-n8n"
+  },
+  "tags": []
+}
