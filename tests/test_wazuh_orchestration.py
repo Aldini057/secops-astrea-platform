@@ -25,6 +25,9 @@ ISOLATE_SCRIPT_PATH = REPO_ROOT / "orchestration" / "wazuh" / "active_response" 
 BLOCK_SCRIPT_PATH = REPO_ROOT / "orchestration" / "wazuh" / "active_response" / "block-ip.sh"
 
 
+has_native_iptables = shutil.which("iptables") is not None
+
+
 def find_bash_executable() -> str | None:
     """Finds a working GNU bash executable across Windows/Linux environments."""
     # Check common Git for Windows paths
@@ -41,7 +44,7 @@ def find_bash_executable() -> str | None:
                     [candidate, "--version"],
                     capture_output=True,
                     text=True,
-                    timeout=5,
+                    timeout=10,
                 )
                 if res.returncode == 0 and "GNU bash" in res.stdout:
                     return candidate
@@ -312,6 +315,7 @@ class TestActiveResponseShellScripts:
                 [bash_bin, "-n", str(script_path)],
                 capture_output=True,
                 text=True,
+                timeout=10,
             )
             assert proc.returncode == 0, (
                 f"Error de sintaxis bash en {script_path.name}:\n{proc.stderr}"
@@ -399,6 +403,10 @@ class TestActiveResponseShellScripts:
         assert cmd == "add"
         assert srcip == "198.51.100.42"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" and not has_native_iptables,
+        reason="Mock iptables execution requires native Linux environment",
+    )
     def test_script_execution_with_mock_iptables_via_bash(self, tmp_path):
         """
         Ejecuta los scripts shell en un entorno aislado con un mock de iptables
@@ -440,15 +448,15 @@ class TestActiveResponseShellScripts:
 
         proc = subprocess.run(
             [bash_bin, str(BLOCK_SCRIPT_PATH)],
-            input=block_payload_add,
+            input=block_payload_add.encode("utf-8"),
             capture_output=True,
-            text=True,
             env=env,
             timeout=10,
         )
         assert proc.returncode == 0, f"block-ip.sh (add) falló: stdout={proc.stdout}, stderr={proc.stderr}"
-        assert "203.0.113.88" in proc.stdout
-        assert "success" in proc.stdout.lower()
+        stdout_text = proc.stdout.decode("utf-8", errors="replace")
+        assert "203.0.113.88" in stdout_text
+        assert "success" in stdout_text.lower()
 
         # ----------------------------------------------------------------------
         # 2. Probar block-ip.sh (Acción 'delete')
@@ -464,14 +472,14 @@ class TestActiveResponseShellScripts:
 
         proc_del = subprocess.run(
             [bash_bin, str(BLOCK_SCRIPT_PATH)],
-            input=block_payload_del,
+            input=block_payload_del.encode("utf-8"),
             capture_output=True,
-            text=True,
             env=env,
             timeout=10,
         )
         assert proc_del.returncode == 0, f"block-ip.sh (delete) falló: stdout={proc_del.stdout}, stderr={proc_del.stderr}"
-        assert "203.0.113.88" in proc_del.stdout
+        stdout_del_text = proc_del.stdout.decode("utf-8", errors="replace")
+        assert "203.0.113.88" in stdout_del_text
 
         # ----------------------------------------------------------------------
         # 3. Probar isolate-host.sh (Acción 'add')
@@ -485,17 +493,17 @@ class TestActiveResponseShellScripts:
 
         proc_isolate_add = subprocess.run(
             [bash_bin, str(ISOLATE_SCRIPT_PATH)],
-            input=isolate_payload_add,
+            input=isolate_payload_add.encode("utf-8"),
             capture_output=True,
-            text=True,
             env=env,
             timeout=10,
         )
         assert proc_isolate_add.returncode == 0, (
             f"isolate-host.sh (add) falló: stdout={proc_isolate_add.stdout}, stderr={proc_isolate_add.stderr}"
         )
-        assert "isolated" in proc_isolate_add.stdout.lower()
-        assert "1514" in proc_isolate_add.stdout or "success" in proc_isolate_add.stdout.lower()
+        stdout_iso_add = proc_isolate_add.stdout.decode("utf-8", errors="replace")
+        assert "isolated" in stdout_iso_add.lower()
+        assert "1514" in stdout_iso_add or "success" in stdout_iso_add.lower()
 
         # ----------------------------------------------------------------------
         # 4. Probar isolate-host.sh (Acción 'delete')
@@ -509,16 +517,16 @@ class TestActiveResponseShellScripts:
 
         proc_isolate_del = subprocess.run(
             [bash_bin, str(ISOLATE_SCRIPT_PATH)],
-            input=isolate_payload_del,
+            input=isolate_payload_del.encode("utf-8"),
             capture_output=True,
-            text=True,
             env=env,
             timeout=10,
         )
         assert proc_isolate_del.returncode == 0, (
             f"isolate-host.sh (delete) falló: stdout={proc_isolate_del.stdout}, stderr={proc_isolate_del.stderr}"
         )
-        assert "restored" in proc_isolate_del.stdout.lower() or "success" in proc_isolate_del.stdout.lower()
+        stdout_iso_del = proc_isolate_del.stdout.decode("utf-8", errors="replace")
+        assert "restored" in stdout_iso_del.lower() or "success" in stdout_iso_del.lower()
 
         # ----------------------------------------------------------------------
         # 5. Validar que el archivo de auditoría se haya generado correctamente
